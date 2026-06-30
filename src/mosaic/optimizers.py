@@ -25,16 +25,9 @@ def _print_iter(iter, aux, v):
         " ".join(
             f"{jax.tree_util.keystr(k, simple=True, separator='.')}:{v: 0.2f}"
             for (k, v) in jax.tree_util.tree_leaves_with_path(aux)
-            if hasattr(v, "item")
-            or isinstance(v, float)
+            if hasattr(v, "item") or isinstance(v, float)
         ),
     )
-
-@eqx.filter_jit
-def _eval_loss(loss, x, key):
-    """Forward-only loss eval, useful for semigreedy which doesn't need grad"""
-    return loss(x, key=key)
-
 
 
 # Split this up so changing optim parameters doesn't trigger re-compilation of loss function
@@ -85,7 +78,6 @@ def batched_eval(
         return v, aux, g
 
     return jax.vmap(single)(xs, keys)
-
 
 
 # def _proposal(sequence, g, temp, alphabet_size: int = 20):
@@ -352,8 +344,6 @@ def simplex_APGM(
         return x, best_x, trajectory
 
 
-
-
 def batched_simplex_APGM(
     *,
     loss_function: AbstractLoss,
@@ -570,11 +560,9 @@ def batch_greedy_descent(
     return best_seq, best_val
 
 
-
-
 class _ColabDesignLoss(eqx.Module):
     """
-    loss for ColabDesign implemented as eqx module to stop recompile 
+    loss for ColabDesign implemented as eqx module to stop recompile
     """
 
     inner: AbstractLoss
@@ -585,10 +573,10 @@ class _ColabDesignLoss(eqx.Module):
     def __call__(self, z, key=None):
         soft_seq = jax.nn.softmax(z / self.temp)
         hard_seq = jax.nn.one_hot(soft_seq.argmax(-1), z.shape[-1])
-        # straight thru estimator 
+        # straight thru estimator
         hard_seq = jax.lax.stop_gradient(hard_seq - soft_seq) + soft_seq
         pseudo = self.soft * soft_seq + (1.0 - self.soft) * z
-        # if hard true use only hard_seq 
+        # if hard true use only hard_seq
         pseudo = self.hard * hard_seq + (1.0 - self.hard) * pseudo
         return self.inner(pseudo, key=key)
 
@@ -653,7 +641,7 @@ def colabdesign_stage(
     for _iter in range(n_steps):
         start_time = time.time()
         frac = (_iter + 1) / n_steps
-        soft = soft_start + (soft_end - soft_start) * frac          # linear ramp
+        soft = soft_start + (soft_end - soft_start) * frac  # linear ramp
         temp = temp_end + (temp_start - temp_end) * (1 - frac) ** 2  # quadratic anneal
 
         # arrays here are for compile
@@ -721,7 +709,7 @@ def bindcraft_design(
     section here: https://www.biorxiv.org/content/10.1101/2024.09.30.615802v1
 
     Note: the bindcraft pipeline also implements an additional discrete optimisation
-    stage, after the gradient bases stages which randomly samples proposals 
+    stage, after the gradient bases stages which randomly samples proposals
     from the pssm at postions the pLDDT indicates the model is uncertain.
 
     Args:
@@ -745,10 +733,10 @@ def bindcraft_design(
     n1, n2 = logits_iters
     # (n_steps, soft_start, soft_end, temp_start, temp_end, hard) per ColabDesign stage.
     stages = [
-        (n1, 0.0, 0.9, 1.0, 1.0, False),    # logits1
-        (n2, 0.9, 1.0, 1.0, 1.0, False),    # logits2
-        (soft_iters, 1.0, 1.0, 1.0, 1e-2, False),    # soft
-        (hard_iters, 1.0, 1.0, 1e-2, 1e-2, True),    # hard
+        (n1, 0.0, 0.9, 1.0, 1.0, False),  # logits1
+        (n2, 0.9, 1.0, 1.0, 1.0, False),  # logits2
+        (soft_iters, 1.0, 1.0, 1.0, 1e-2, False),  # soft
+        (hard_iters, 1.0, 1.0, 1e-2, 1e-2, True),  # hard
     ]
     keys = jax.random.split(key, len(stages) + 1)
     k_init, stage_keys = keys[0], keys[1:]
@@ -762,8 +750,10 @@ def bindcraft_design(
             loss_function=loss_function,
             x=x,
             n_steps=n_steps,
-            soft_start=s0, soft_end=s1,
-            temp_start=t0, temp_end=t1,
+            soft_start=s0,
+            soft_end=s1,
+            temp_start=t0,
+            temp_end=t1,
             hard=hard,
             lr=lr,
             key=k,
