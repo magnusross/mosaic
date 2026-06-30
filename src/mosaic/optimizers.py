@@ -25,8 +25,7 @@ def _print_iter(iter, aux, v):
         " ".join(
             f"{jax.tree_util.keystr(k, simple=True, separator='.')}:{v: 0.2f}"
             for (k, v) in jax.tree_util.tree_leaves_with_path(aux)
-            if hasattr(v, "item")
-            or isinstance(v, float)
+            if hasattr(v, "item") or isinstance(v, float)
         ),
     )
 
@@ -79,7 +78,6 @@ def batched_eval(
         return v, aux, g
 
     return jax.vmap(single)(xs, keys)
-
 
 
 # def _proposal(sequence, g, temp, alphabet_size: int = 20):
@@ -346,8 +344,6 @@ def simplex_APGM(
         return x, best_x, trajectory
 
 
-
-
 def batched_simplex_APGM(
     *,
     loss_function: AbstractLoss,
@@ -562,3 +558,212 @@ def batch_greedy_descent(
         )
 
     return best_seq, best_val
+
+
+class _ColabDesignLoss(eqx.Module):
+    """
+    loss for ColabDesign implemented as eqx module to stop recompile
+    """
+
+    inner: AbstractLoss
+    soft: Array
+    temp: Array
+    hard: Array
+
+    def __call__(self, z, key=None):
+        soft_seq = jax.nn.softmax(z / self.temp)
+        hard_seq = jax.nn.one_hot(soft_seq.argmax(-1), z.shape[-1])
+        # straight thru estimator
+        hard_seq = jax.lax.stop_gradient(hard_seq - soft_seq) + soft_seq
+        pseudo = self.soft * soft_seq + (1.0 - self.soft) * z
+        # if hard true use only hard_seq
+        pseudo = self.hard * hard_seq + (1.0 - self.hard) * pseudo
+        return self.inner(pseudo, key=key)
+
+
+def _seq_grad_norm(g):
+    """Lifted from ColabDesign _norm_seq_grad."""
+    eff_L = (jnp.square(g).sum(-1, keepdims=True) > 0).sum(-2, keepdims=True)
+    gn = jnp.linalg.norm(g, axis=(-1, -2), keepdims=True)
+    return g * jnp.sqrt(eff_L) / (gn + 1e-7)
+
+
+def colabdesign_stage(
+    *,
+    loss_function: AbstractLoss,
+    x: Float[Array, "N 20"],
+    n_steps: int,
+    soft_start: float,
+    soft_end: float,
+    temp_start: float,
+    temp_end: float,
+    hard: bool,
+    lr: float,
+    norm_seq_grad: bool = True,
+    max_gradient_norm: float | None = None,
+    key=None,
+    trajectory_fn: Callable[tuple[PyTree, Float[Array, "N 20"]], any] | None = None,
+):
+    """
+    One ColabDesign/AfDesign stage: n_steps of normalised SGD on a logit iterate,
+    with soft ramping linearly, temp annealing quadratically, and hard fixed. Logits
+    in and out, so stages chain with no softmax round-trip (the BindCraft recipe).
+
+    Args:
+    - loss_function: function to minimize
+    - x: initial logits (N x 20), centered per row on entry
+    - n_steps: number of optimization steps
+    - soft_start, soft_end: linear soft ramp (0 = raw logits, 1 = softmax)
+    - temp_start, temp_end: quadratic temp anneal
+    - hard: if True, blend in a straight-through one-hot for the stage
+    - lr: base learning rate (ColabDesign default 0.1)
+    - norm_seq_grad: normalise the gradient to sqrt(L); else clip at max_gradient_norm
+    - max_gradient_norm: clip norm when norm_seq_grad is False (default sqrt(N))
+    - key: jax random key
+    - trajectory_fn: takes (aux, x) and returns any value
+
+    returns:
+    - x: final logits
+    - trajectory: list of trajectory information if `trajectory_fn` is provided
+    """
+    if max_gradient_norm is None:
+        max_gradient_norm = float(np.sqrt(x.shape[0]))
+    if key is None:
+        key = jax.random.key(np.random.randint(0, 10000))
+
+    x = jnp.asarray(x, dtype=jnp.float32)
+    # Center logits per row: log(pssm) carries a DC offset that softmax ignores but
+    # is off-distribution for the raw-logits stage (soft<1). The mosaic gradient is
+    # row-centered, so x stays zero-mean (re-centering a chained stage is a no-op).
+    x = x - x.mean(-1, keepdims=True)
+    trajectory = []
+
+    for _iter in range(n_steps):
+        start_time = time.time()
+        frac = (_iter + 1) / n_steps
+        soft = soft_start + (soft_end - soft_start) * frac  # linear ramp
+        temp = temp_end + (temp_start - temp_end) * (1 - frac) ** 2  # quadratic anneal
+
+        # arrays here are for compile
+        wrapped = _ColabDesignLoss(
+            inner=loss_function,
+            soft=jnp.asarray(soft, dtype=jnp.float32),
+            temp=jnp.asarray(temp, dtype=jnp.float32),
+            hard=jnp.asarray(hard, dtype=jnp.float32),
+        )
+        (value, aux), g = _eval_loss_and_grad(wrapped, x, key)
+        value = float(value)
+        key = jax.random.fold_in(key, 0)
+
+        if norm_seq_grad:
+            g = _seq_grad_norm(g)
+        else:
+            n = np.sqrt((g**2).sum())
+            if n > max_gradient_norm:
+                g = g * (max_gradient_norm / n)
+
+        lr_scale = (1.0 - soft) + soft * temp
+        x = x - (lr * lr_scale) * g
+
+        average_nnz = float((jax.nn.softmax(x) > 0.01).sum(-1).mean())
+        aux = {
+            "loss": value,
+            "nnz": average_nnz,
+            "time": time.time() - start_time,
+            "soft": float(soft),
+            "temp": float(temp),
+            "hard": float(hard),
+            "": aux,
+        }
+        if trajectory_fn is not None:
+            trajectory.append(trajectory_fn(aux, x))
+
+        _print_iter(
+            _iter,
+            eqx.filter(aux, lambda v: isinstance(v, float) or v.shape == ()),
+            value,
+        )
+
+    if trajectory_fn is None:
+        return x
+    return x, trajectory
+
+
+def bindcraft_design(
+    *,
+    loss_function: AbstractLoss,
+    length: int,
+    lr: float = 0.1,
+    logits_iters: tuple[int, int] = (50, 25),
+    soft_iters: int = 45,
+    hard_iters: int = 5,
+    alphabet_size: int = 20,
+    key=None,
+    trajectory_fn: Callable[tuple[PyTree, Float[Array, "N 20"]], any] | None = None,
+):
+    """
+    The default 4-stage pipeline from bindcraft.
+    The first two stages operate on unconstrained logits which are then hardened to
+    probabilities. Parameters follow default_4stage_multimer.json in BindCraft; init is
+    ColabDesign's set_seq default (0.01*normal). See the "materials and methods"
+    section here: https://www.biorxiv.org/content/10.1101/2024.09.30.615802v1
+
+    Note: the bindcraft pipeline also implements an additional discrete optimisation
+    stage, after the gradient bases stages which randomly samples proposals
+    from the pssm at postions the pLDDT indicates the model is uncertain.
+
+    Args:
+    - loss_function: function to minimise.
+    - length: number of residues to design.
+    - lr: ColabDesign base learning rate.
+    - logits_iters: (logits1, logits2) step counts.
+    - soft_iters: steps for the temp-anneal stage.
+    - hard_iters: steps for the straight-through stage.
+    - alphabet_size: token alphabet size.
+    - key: jax random key.
+    - trajectory_fn: takes (aux, x) and returns any value.
+
+    returns:
+    - pssm: final soft sequence, softmax of the post-hard logits (length x alphabet_size).
+    - trajectory: concatenated trajectory information if trajectory_fn is provided.
+    """
+    if key is None:
+        key = jax.random.key(np.random.randint(0, 10000))
+
+    n1, n2 = logits_iters
+    # (n_steps, soft_start, soft_end, temp_start, temp_end, hard) per ColabDesign stage.
+    stages = [
+        (n1, 0.0, 0.9, 1.0, 1.0, False),  # logits1
+        (n2, 0.9, 1.0, 1.0, 1.0, False),  # logits2
+        (soft_iters, 1.0, 1.0, 1.0, 1e-2, False),  # soft
+        (hard_iters, 1.0, 1.0, 1e-2, 1e-2, True),  # hard
+    ]
+    keys = jax.random.split(key, len(stages) + 1)
+    k_init, stage_keys = keys[0], keys[1:]
+
+    # ColabDesign set_seq default: near-uniform, origin-centered logits.
+    x = 0.01 * jax.random.normal(k_init, (length, alphabet_size))
+
+    trajectory = []
+    for (n_steps, s0, s1, t0, t1, hard), k in zip(stages, stage_keys):
+        out = colabdesign_stage(
+            loss_function=loss_function,
+            x=x,
+            n_steps=n_steps,
+            soft_start=s0,
+            soft_end=s1,
+            temp_start=t0,
+            temp_end=t1,
+            hard=hard,
+            lr=lr,
+            key=k,
+            trajectory_fn=trajectory_fn,
+        )
+        x, t = out if trajectory_fn is not None else (out, [])
+        trajectory += t
+
+    # ColabDesign uses the final (post-hard) iterate; softmax to read out a pssm.
+    pssm = jax.nn.softmax(x)
+    if trajectory_fn is None:
+        return pssm
+    return pssm, trajectory
