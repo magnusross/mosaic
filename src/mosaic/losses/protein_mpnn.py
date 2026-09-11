@@ -248,8 +248,10 @@ def _autoregressive_inverse_fold(
     total_length = output.full_sequence.shape[0]
     mask = jnp.ones(total_length, dtype=jnp.int32)
     residue_idx = _per_chain_residue_idx(output.asym_id, output.residue_idx)
+    # separate structure noise, decoding order, and residue sampling
     encode_key, order_key, sample_key = jax.random.split(key, 3)
 
+    # encode the backbone once
     h_V, h_E, E_idx = mpnn.encode(
         X=output.backbone_coordinates,
         mask=mask,
@@ -263,20 +265,23 @@ def _autoregressive_inverse_fold(
     decoding_order = decoding_order.at[:binder_length].add(2.0)
     binder_order = jnp.argsort(decoding_order[:binder_length])
 
+    # mark neighbors decoded before each residue
     rank = jnp.argsort(jnp.argsort(decoding_order))
     order_mask = rank[None, :] < rank[:, None]
     mask_bw = jnp.take_along_axis(order_mask[None], E_idx, axis=2)[..., None]
     mask_bw *= mask[None, :, None, None]
 
+    # seed sequence embeddings with the fixed target
     token_matrix = jnp.asarray(boltz_to_mpnn_matrix())
     sequence_mpnn = output.full_sequence.at[:binder_length].set(0) @ token_matrix
     h_S = (sequence_mpnn @ mpnn.W_s.weight)[None]
     h_EX_encoder = cat_neighbors_nodes(jnp.zeros_like(h_S), h_E, E_idx)
     h_EXV_encoder = cat_neighbors_nodes(h_V, h_EX_encoder, E_idx)
+    # use encoder features for residues not yet decoded
     h_EXV_encoder_fw = (1.0 - mask_bw) * h_EXV_encoder
 
-    # initialize the fixed-target states in parallel \
-    # binder states are overwritten in decoding order and cannot affect earlier positions.
+    # cache fixed-target states across decoder layers
+    # provisional binder states are overwritten before use
     h_ES = cat_neighbors_nodes(h_S, h_E, E_idx)
     h_V_stack = [h_V]
     for layer in mpnn.decoder_layers:
@@ -285,6 +290,7 @@ def _autoregressive_inverse_fold(
         h_V_stack.append(h_V)
     h_V_stack = jnp.stack(h_V_stack)
 
+    # draw once for each binder position
     gumbel = jax.random.gumbel(sample_key, (binder_length, len(TOKENS)))
     bias = jnp.zeros_like(gumbel) if bias is None else bias
     sequence = jnp.zeros(binder_length, dtype=jnp.int32)
@@ -298,27 +304,32 @@ def _autoregressive_inverse_fold(
 
     def sample_position(carry, position):
         h_S, h_V_stack, sequence = carry
+        # gather this residue and its graph neighborhood
         E_idx_t = gather_position(E_idx, position)
         h_ES_t = cat_position(h_S, gather_position(h_E, position), E_idx_t)
         mask_bw_t = gather_position(mask_bw, position)
         h_EXV_t = gather_position(h_EXV_encoder_fw, position)
         mask_t = mask[position][None, None]
 
+        # update only this residue through each decoder layer
         for layer_idx, layer in enumerate(mpnn.decoder_layers):
             h_V_t = gather_position(h_V_stack[layer_idx], position)
             h_ESV_t = cat_position(h_V_stack[layer_idx], h_ES_t, E_idx_t)
             h_V_t = layer(h_V_t, mask_bw_t * h_ESV_t + h_EXV_t, mask_t)
             h_V_stack = h_V_stack.at[layer_idx + 1, :, position].set(h_V_t[:, 0])
 
+        # sample in mosaic's 20-residue alphabet
         logits = mpnn.W_out(h_V_stack[-1, 0, position]) @ token_matrix.T
         residue = (logits + bias[position] + temp * gumbel[position]).argmax()
         sequence = sequence.at[position].set(residue)
         embedding = (
             jax.nn.one_hot(residue, len(TOKENS)) @ token_matrix
         ) @ mpnn.W_s.weight
+        # expose the sampled residue to later positions
         h_S = h_S.at[0, position].set(embedding)
         return (h_S, h_V_stack, sequence), None
 
+    # follow the sampled binder order
     (_, _, sequence), _ = jax.lax.scan(
         sample_position,
         (h_S, h_V_stack, sequence),
